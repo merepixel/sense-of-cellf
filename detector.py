@@ -62,7 +62,13 @@ class CellDetector:
 
         # Lazy import so the module can be imported even if cellpose isn't installed
         from cellpose import models
-        self.model = models.Cellpose(model_type="cyto2", gpu=use_gpu)
+        # cellpose 3.x uses CellposeModel; fall back to legacy Cellpose for 2.x
+        if hasattr(models, 'CellposeModel'):
+            self.model = models.CellposeModel(model_type="cyto2", gpu=use_gpu)
+            self._cp3 = True
+        else:
+            self.model = models.Cellpose(model_type="cyto2", gpu=use_gpu)
+            self._cp3 = False
 
     # ------------------------------------------------------------------ #
     # Segmentation
@@ -78,13 +84,25 @@ class CellDetector:
         Returns a uint32 label mask (H, W) where 0 = background.
         """
         gray = rgb_frame[:, :, 0]                    # (H, W) float32 in [0,1]
-        masks, _, _, _ = self.model.eval(
-            [gray],
-            diameter=None,         # auto-estimate diameter
-            channels=[0, 0],       # grayscale mode
-            flow_threshold=0.4,
-            cellprob_threshold=0.0,
-        )
+        if self._cp3:
+            # cellpose 3.x: CellposeModel.eval returns (masks, flows, styles)
+            # channels arg dropped; pass grayscale directly
+            result = self.model.eval(
+                [gray],
+                diameter=None,
+                flow_threshold=0.4,
+                cellprob_threshold=0.0,
+            )
+        else:
+            # cellpose 2.x: returns (masks, flows, styles, diams)
+            result = self.model.eval(
+                [gray],
+                diameter=None,
+                channels=[0, 0],
+                flow_threshold=0.4,
+                cellprob_threshold=0.0,
+            )
+        masks = result[0]
         return masks[0].astype(np.uint32)
 
     # ------------------------------------------------------------------ #
