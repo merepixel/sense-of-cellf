@@ -99,13 +99,21 @@ class CellDINOEmbedder(nn.Module):
     def _load_backbone(self, model_id: str) -> nn.Module:
         """
         Attempt to load model_id; fall back to FALLBACK_MODEL_ID if unavailable.
-        Supports both transformers AutoModel and torch.hub DINOv2 variants.
+        After loading, probes the forward signature to determine calling convention.
+        Sets self._call_convention to one of:
+          'pixel_values_cls'  — transformers DINOv2 style (last_hidden_state[:, 0])
+          'pixel_values_pool' — transformers with pooler_output
+          'positional_cls'    — MAE / other models taking positional x arg
+          'positional_direct' — torch.hub DINOv2 returning tensor directly
         """
         try:
             from transformers import AutoModel
             print(f"[embedder] Loading {model_id} via transformers …")
-            model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
+            model = AutoModel.from_pretrained(model_id)
             self._use_transformers = True
+            # Probe calling convention with a tiny dummy (on CPU before .to(device))
+            self._call_convention = self._probe_convention(model)
+            print(f"[embedder] Call convention: {self._call_convention}")
             return model
         except Exception as e:
             print(f"[embedder] Could not load {model_id}: {e}")
@@ -113,20 +121,57 @@ class CellDINOEmbedder(nn.Module):
                 print(f"[embedder] Falling back to {FALLBACK_MODEL_ID} …")
                 return self._load_backbone(FALLBACK_MODEL_ID)
             raise RuntimeError(
-                f"Could not load any DINOv2 backbone. "
-                f"Install transformers and run: "
-                f"pip install transformers torch torchvision"
+                "Could not load any backbone. "
+                "pip install transformers torch torchvision"
             ) from e
 
+    @staticmethod
+    def _probe_convention(model: nn.Module) -> str:
+        """Try different forward signatures on a dummy input and return the one that works."""
+        model.eval()
+        dummy = torch.zeros(1, 3, 224, 224)
+        with torch.no_grad():
+            # 1. transformers DINOv2 — pixel_values kwarg, last_hidden_state
+            try:
+                out = model(pixel_values=dummy)
+                if hasattr(out, 'last_hidden_state'):
+                    return 'pixel_values_cls'
+                if hasattr(out, 'pooler_output') and out.pooler_output is not None:
+                    return 'pixel_values_pool'
+            except TypeError:
+                pass
+            # 2. MAE / custom models — positional x arg, returns tensor or has last_hidden_state
+            try:
+                out = model(dummy)
+                if isinstance(out, torch.Tensor):
+                    return 'positional_direct'
+                if hasattr(out, 'last_hidden_state'):
+                    return 'positional_cls'
+                # fallback: take first tensor attribute
+                return 'positional_direct'
+            except Exception:
+                pass
+        return 'pixel_values_cls'  # last-resort guess
+
     def _forward_backbone(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Return CLS token embedding from backbone."""
-        if self._use_transformers:
-            outputs = self.backbone(pixel_values=pixel_values)
-            # transformers DINOv2: last_hidden_state[:, 0, :] is the CLS token
-            return outputs.last_hidden_state[:, 0, :]
-        else:
-            # torch.hub DINOv2 returns features directly
-            return self.backbone(pixel_values)
+        """Return a (B, D) embedding tensor using the probed calling convention."""
+        conv = self._call_convention
+        with torch.set_grad_enabled(self.training):
+            if conv == 'pixel_values_cls':
+                out = self.backbone(pixel_values=pixel_values)
+                return out.last_hidden_state[:, 0, :]
+            elif conv == 'pixel_values_pool':
+                out = self.backbone(pixel_values=pixel_values)
+                return out.pooler_output
+            elif conv == 'positional_cls':
+                out = self.backbone(pixel_values)
+                return out.last_hidden_state[:, 0, :]
+            else:  # positional_direct
+                out = self.backbone(pixel_values)
+                if isinstance(out, torch.Tensor):
+                    # If shape is (B, D) use as-is; if (B, N, D) take CLS (index 0)
+                    return out[:, 0] if out.dim() == 3 else out
+                return out.last_hidden_state[:, 0, :]
 
     # ------------------------------------------------------------------ #
     # nn.Module forward
