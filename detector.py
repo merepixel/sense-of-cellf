@@ -62,8 +62,12 @@ class CellDetector:
 
         import cellpose
         from cellpose import models
+        from importlib.metadata import version as pkg_version
 
-        major = int(cellpose.__version__.split('.')[0])
+        try:
+            major = int(pkg_version('cellpose').split('.')[0])
+        except Exception:
+            major = 3  # safe fallback
 
         if major >= 4:
             # cellpose 4.x: CellposeModel() with no model_type IS CellposeSAM
