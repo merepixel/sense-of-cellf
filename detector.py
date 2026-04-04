@@ -60,11 +60,14 @@ class CellDetector:
         self.crop_size = crop_size
         self.min_area = min_area
 
+        import cellpose
         from cellpose import models
-        # CellposeSAM (cellpose 4.x) — no model_type needed, SAM backbone
-        # Falls back to CellposeModel(cyto3) for cellpose 3.x
-        if hasattr(models, 'CellposeSAM'):
-            self.model = models.CellposeSAM(gpu=use_gpu)
+
+        major = int(cellpose.__version__.split('.')[0])
+
+        if major >= 4:
+            # cellpose 4.x: CellposeModel() with no model_type IS CellposeSAM
+            self.model = models.CellposeModel(gpu=use_gpu)
             self._backend = 'sam'
         elif hasattr(models, 'CellposeModel'):
             self.model = models.CellposeModel(model_type="cyto3", gpu=use_gpu)
@@ -72,7 +75,7 @@ class CellDetector:
         else:
             self.model = models.Cellpose(model_type="cyto2", gpu=use_gpu)
             self._backend = 'cp2'
-        print(f'[detector] Using cellpose backend: {self._backend}')
+        print(f'[detector] cellpose {cellpose.__version__} → backend: {self._backend}')
 
     # ------------------------------------------------------------------ #
     # Segmentation
