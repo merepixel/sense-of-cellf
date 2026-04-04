@@ -62,11 +62,11 @@ class CellDetector:
 
         # Lazy import so the module can be imported even if cellpose isn't installed
         from cellpose import models
-        # cellpose 3.x uses CellposeModel; fall back to legacy Cellpose for 2.x
-        if hasattr(models, 'CellposeModel'):
+        # Try cellpose 3.x API (CellposeModel), fall back to 2.x (Cellpose)
+        try:
             self.model = models.CellposeModel(model_type="cyto2", gpu=use_gpu)
             self._cp3 = True
-        else:
+        except AttributeError:
             self.model = models.Cellpose(model_type="cyto2", gpu=use_gpu)
             self._cp3 = False
 
