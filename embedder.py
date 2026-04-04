@@ -88,10 +88,23 @@ class CellDINOEmbedder(nn.Module):
         self.backbone = self._load_backbone(model_id)
         self.backbone.to(self.device)
 
-        # Infer embedding dimension from a dummy forward pass
+        # Infer embedding dimension from a dummy forward pass.
+        # If it fails (e.g. model expects different channels/resolution),
+        # fall back to dinov2-base automatically.
         with torch.no_grad():
             dummy = torch.zeros(1, 3, img_size, img_size, device=self.device)
-            out = self._forward_backbone(dummy)
+            try:
+                out = self._forward_backbone(dummy)
+            except Exception as e:
+                if model_id != FALLBACK_MODEL_ID:
+                    print(f"[embedder] {model_id} incompatible with 3-ch {img_size}px input "
+                          f"({e.__class__.__name__}: {e})")
+                    print(f"[embedder] Falling back to {FALLBACK_MODEL_ID} …")
+                    self.backbone = self._load_backbone(FALLBACK_MODEL_ID)
+                    self.backbone.to(self.device)
+                    out = self._forward_backbone(dummy)
+                else:
+                    raise
         self.embed_dim: int = out.shape[-1]
 
     # ------------------------------------------------------------------ #
