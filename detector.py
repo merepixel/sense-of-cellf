@@ -60,15 +60,19 @@ class CellDetector:
         self.crop_size = crop_size
         self.min_area = min_area
 
-        # Lazy import so the module can be imported even if cellpose isn't installed
         from cellpose import models
-        # Try cellpose 3.x API (CellposeModel), fall back to 2.x (Cellpose)
-        try:
-            self.model = models.CellposeModel(model_type="cyto2", gpu=use_gpu)
-            self._cp3 = True
-        except AttributeError:
+        # CellposeSAM (cellpose 4.x) — no model_type needed, SAM backbone
+        # Falls back to CellposeModel(cyto3) for cellpose 3.x
+        if hasattr(models, 'CellposeSAM'):
+            self.model = models.CellposeSAM(gpu=use_gpu)
+            self._backend = 'sam'
+        elif hasattr(models, 'CellposeModel'):
+            self.model = models.CellposeModel(model_type="cyto3", gpu=use_gpu)
+            self._backend = 'cp3'
+        else:
             self.model = models.Cellpose(model_type="cyto2", gpu=use_gpu)
-            self._cp3 = False
+            self._backend = 'cp2'
+        print(f'[detector] Using cellpose backend: {self._backend}')
 
     # ------------------------------------------------------------------ #
     # Segmentation
@@ -76,17 +80,25 @@ class CellDetector:
 
     def segment(self, rgb_frame: np.ndarray) -> np.ndarray:
         """
-        Run CellPose on a single (H, W, 3) float32 frame.
+        Run CellPose/CellposeSAM on a single (H, W, 3) float32 frame.
 
-        CellPose expects uint8 or float images.  We pass the grayscale channel
-        (all three are identical) and use channels=[0,0] (grayscale, no nuclear).
+        CellposeSAM accepts a 3-channel RGB image directly.
+        Older backends receive the grayscale channel only.
 
         Returns a uint32 label mask (H, W) where 0 = background.
         """
-        gray = rgb_frame[:, :, 0]                    # (H, W) float32 in [0,1]
-        if self._cp3:
-            # cellpose 3.x: CellposeModel.eval returns (masks, flows, styles)
-            # channels arg dropped; pass grayscale directly
+        if self._backend == 'sam':
+            # CellposeSAM: pass the full RGB image, returns (masks, flows, styles)
+            # Convert float32 [0,1] → uint8 [0,255] as SAM expects uint8
+            img_uint8 = (rgb_frame * 255).clip(0, 255).astype(np.uint8)
+            result = self.model.eval(
+                [img_uint8],
+                diameter=None,
+                flow_threshold=0.4,
+                cellprob_threshold=0.0,
+            )
+        elif self._backend == 'cp3':
+            gray = rgb_frame[:, :, 0]
             result = self.model.eval(
                 [gray],
                 diameter=None,
@@ -95,6 +107,7 @@ class CellDetector:
             )
         else:
             # cellpose 2.x: returns (masks, flows, styles, diams)
+            gray = rgb_frame[:, :, 0]
             result = self.model.eval(
                 [gray],
                 diameter=None,
