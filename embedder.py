@@ -89,8 +89,9 @@ class CellDINOEmbedder(nn.Module):
         self.backbone.to(self.device)
 
         # Enable gradient checkpointing to trade compute for memory.
-        # Works for transformers models that expose this method.
-        if hasattr(self.backbone, 'gradient_checkpointing_enable'):
+        # Only if the model explicitly supports it (MAEModel does not).
+        if (hasattr(self.backbone, 'gradient_checkpointing_enable')
+                and getattr(self.backbone, 'supports_gradient_checkpointing', False)):
             self.backbone.gradient_checkpointing_enable()
 
         # Infer embedding dimension from a dummy forward pass.
