@@ -1,0 +1,195 @@
+"""
+embedder.py
+Load Cell-DINO (DINOv2 ViT fine-tuned on single-cell microscopy) from HuggingFace
+and compute CLS-token embeddings for cell crops.
+
+Model: recursionpharma/OpenPhenom  (DINOv2 ViT-S/8 fine-tuned on RxRx datasets)
+Fallback: facebook/dinov2-base     (general DINOv2, works well on microscopy)
+
+The embedder is used:
+  - During training  (with gradient) — Cell-DINO weights are updated
+  - During evaluation (no gradient)  — frozen after loading checkpoint
+"""
+
+from pathlib import Path
+from typing import List, Optional, Union
+import numpy as np
+import torch
+import torch.nn as nn
+from torchvision import transforms
+
+# --------------------------------------------------------------------------- #
+# HuggingFace model IDs
+# --------------------------------------------------------------------------- #
+
+# Primary: a DINOv2 ViT fine-tuned on single-cell microscopy images
+CELL_DINO_MODEL_ID = "recursionpharma/OpenPhenom"
+# Fallback: standard DINOv2-base (strong general visual features)
+FALLBACK_MODEL_ID = "facebook/dinov2-base"
+
+
+# --------------------------------------------------------------------------- #
+# Preprocessing
+# --------------------------------------------------------------------------- #
+
+def build_transform(img_size: int = 224) -> transforms.Compose:
+    """
+    Standard DINOv2 preprocessing:
+      - Resize to img_size x img_size
+      - Normalize with ImageNet mean/std (DINOv2 was trained with these)
+    Input: float32 numpy array (H, W, 3) in [0, 1]
+    """
+    return transforms.Compose([
+        transforms.ToTensor(),                        # (H, W, 3) → (3, H, W), keeps [0,1]
+        transforms.Resize((img_size, img_size), antialias=True),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        ),
+    ])
+
+
+# --------------------------------------------------------------------------- #
+# CellDINOEmbedder
+# --------------------------------------------------------------------------- #
+
+class CellDINOEmbedder(nn.Module):
+    """
+    Wraps a DINOv2 ViT model and exposes a forward pass that returns the
+    CLS-token embedding (768-dim for ViT-B, 384-dim for ViT-S).
+
+    Parameters
+    ----------
+    model_id  : HuggingFace model identifier
+    img_size  : input resolution expected by the model (default 224)
+    device    : 'cuda', 'mps', or 'cpu'
+    """
+
+    def __init__(
+        self,
+        model_id: str = CELL_DINO_MODEL_ID,
+        img_size: int = 224,
+        device: Optional[str] = None,
+    ):
+        super().__init__()
+
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        self.device = torch.device(device)
+
+        self.img_size = img_size
+        self.transform = build_transform(img_size)
+
+        self.backbone = self._load_backbone(model_id)
+        self.backbone.to(self.device)
+
+        # Infer embedding dimension from a dummy forward pass
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, img_size, img_size, device=self.device)
+            out = self._forward_backbone(dummy)
+        self.embed_dim: int = out.shape[-1]
+
+    # ------------------------------------------------------------------ #
+
+    def _load_backbone(self, model_id: str) -> nn.Module:
+        """
+        Attempt to load model_id; fall back to FALLBACK_MODEL_ID if unavailable.
+        Supports both transformers AutoModel and torch.hub DINOv2 variants.
+        """
+        try:
+            from transformers import AutoModel
+            print(f"[embedder] Loading {model_id} via transformers …")
+            model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
+            self._use_transformers = True
+            return model
+        except Exception as e:
+            print(f"[embedder] Could not load {model_id}: {e}")
+            if model_id != FALLBACK_MODEL_ID:
+                print(f"[embedder] Falling back to {FALLBACK_MODEL_ID} …")
+                return self._load_backbone(FALLBACK_MODEL_ID)
+            raise RuntimeError(
+                f"Could not load any DINOv2 backbone. "
+                f"Install transformers and run: "
+                f"pip install transformers torch torchvision"
+            ) from e
+
+    def _forward_backbone(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Return CLS token embedding from backbone."""
+        if self._use_transformers:
+            outputs = self.backbone(pixel_values=pixel_values)
+            # transformers DINOv2: last_hidden_state[:, 0, :] is the CLS token
+            return outputs.last_hidden_state[:, 0, :]
+        else:
+            # torch.hub DINOv2 returns features directly
+            return self.backbone(pixel_values)
+
+    # ------------------------------------------------------------------ #
+    # nn.Module forward
+    # ------------------------------------------------------------------ #
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        pixel_values : (B, 3, H, W) tensor, already normalised
+
+        Returns
+        -------
+        embeddings : (B, D) L2-normalised CLS token embeddings
+        """
+        embeddings = self._forward_backbone(pixel_values)
+        return nn.functional.normalize(embeddings, dim=-1)
+
+    # ------------------------------------------------------------------ #
+    # Convenience: embed a batch of numpy crops
+    # ------------------------------------------------------------------ #
+
+    def embed_crops(
+        self,
+        crops: List[np.ndarray],
+        no_grad: bool = False,
+    ) -> torch.Tensor:
+        """
+        Embed a list of float32 numpy crops (H, W, 3) in [0,1].
+
+        Parameters
+        ----------
+        crops   : list of ndarray, each (H, W, 3) float32 [0,1]
+        no_grad : if True, run under torch.no_grad()
+
+        Returns
+        -------
+        embeddings : (N, D) float32 tensor on self.device
+        """
+        if not crops:
+            return torch.zeros(0, self.embed_dim, device=self.device)
+
+        tensors = [self.transform(crop) for crop in crops]          # list of (3, H, W)
+        batch = torch.stack(tensors).to(self.device)               # (N, 3, H, W)
+
+        if no_grad:
+            with torch.no_grad():
+                return self.forward(batch)
+        else:
+            return self.forward(batch)
+
+    # ------------------------------------------------------------------ #
+    # Checkpoint helpers
+    # ------------------------------------------------------------------ #
+
+    def save_checkpoint(self, path: Union[str, Path]) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.backbone.state_dict(), str(path))
+        print(f"[embedder] Checkpoint saved → {path}")
+
+    def load_checkpoint(self, path: Union[str, Path]) -> None:
+        path = Path(path)
+        state = torch.load(str(path), map_location=self.device)
+        self.backbone.load_state_dict(state)
+        print(f"[embedder] Checkpoint loaded ← {path}")

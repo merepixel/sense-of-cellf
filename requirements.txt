@@ -1,0 +1,8 @@
+tifffile
+cellpose
+scikit-image
+transformers
+torch
+torchvision
+scikit-learn
+numpy
