@@ -79,7 +79,7 @@ class CellDetector:
         else:
             self.model = models.Cellpose(model_type="cyto2", gpu=use_gpu)
             self._backend = 'cp2'
-        print(f'[detector] cellpose {cellpose.__version__} → backend: {self._backend}')
+        print(f'[detector] cellpose {pkg_version("cellpose")} → backend: {self._backend}')
 
     # ------------------------------------------------------------------ #
     # Segmentation
