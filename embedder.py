@@ -22,10 +22,10 @@ from torchvision import transforms
 # HuggingFace model IDs
 # --------------------------------------------------------------------------- #
 
-# Primary: a DINOv2 ViT fine-tuned on single-cell microscopy images
+# Primary attempt: single-cell microscopy fine-tuned DINOv2 (falls back if incompatible)
 CELL_DINO_MODEL_ID = "recursionpharma/OpenPhenom"
-# Fallback: standard DINOv2-base (strong general visual features)
-FALLBACK_MODEL_ID = "facebook/dinov2-base"
+# Fallback: DINOv2-small — half the memory of base, still 384-dim, good on microscopy
+FALLBACK_MODEL_ID = "facebook/dinov2-small"
 
 
 # --------------------------------------------------------------------------- #
@@ -87,6 +87,11 @@ class CellDINOEmbedder(nn.Module):
 
         self.backbone = self._load_backbone(model_id)
         self.backbone.to(self.device)
+
+        # Enable gradient checkpointing to trade compute for memory.
+        # Works for transformers models that expose this method.
+        if hasattr(self.backbone, 'gradient_checkpointing_enable'):
+            self.backbone.gradient_checkpointing_enable()
 
         # Infer embedding dimension from a dummy forward pass.
         # If it fails (e.g. model expects different channels/resolution),

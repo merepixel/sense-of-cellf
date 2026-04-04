@@ -375,38 +375,42 @@ def train(
                 continue
 
             anchor_idx = [i for i, _ in matched]
-            pos_idx = [j for _, j in matched]
+            pos_idx_list = [j for _, j in matched]
 
             anchor_crops = [cells_t[i].crop for i in anchor_idx]
-            pos_crops = [cells_t1[j].crop for j in pos_idx]
+            pos_crops    = [cells_t1[j].crop for j in pos_idx_list]
 
             if not anchor_crops:
                 continue
 
-            # Embed anchors and positives
+            # Only anchors need gradients.
+            # Positives and hard-neg candidates use stop-gradient (no_grad),
+            # which halves activation memory and is standard in contrastive learning.
             anchors_emb = embedder.embed_crops(anchor_crops, no_grad=False)  # (N, D) with grad
+
             with torch.no_grad():
-                pos_emb = embedder.embed_crops(pos_crops, no_grad=True)      # (N, D) no grad
-            # Re-embed positives with grad for symmetric loss
-            pos_emb = embedder.embed_crops(pos_crops, no_grad=False)
+                pos_emb = embedder.embed_crops(pos_crops, no_grad=True)       # (N, D) detached
 
-            # Mine within-frame hard negatives for the anchor frame
-            # We need all cells in frame t embedded
-            all_crops_t = [c.crop for c in cells_t]
-            all_emb_t = embedder.embed_crops(all_crops_t, no_grad=False)     # (M, D)
+                # Hard negatives: embed ALL cells in frame t, mine top-k
+                all_crops_t = [c.crop for c in cells_t]
+                all_emb_t   = embedder.embed_crops(all_crops_t, no_grad=True) # (M, D) detached
 
-            hn = mine_hard_negatives(all_emb_t, anchor_idx, k=hard_neg_k)   # (N, K, D)
+            hn = mine_hard_negatives(all_emb_t, anchor_idx, k=hard_neg_k)    # (N, K, D)
 
             loss = criterion(anchors_emb, pos_emb, hard_negatives=hn)
 
             optimizer.zero_grad()
             loss.backward()
-            # Gradient clipping for stability
             torch.nn.utils.clip_grad_norm_(embedder.backbone.parameters(), max_norm=1.0)
             optimizer.step()
 
             epoch_loss += loss.item()
             n_batches += 1
+
+            # Free graph memory immediately between frame-pairs
+            del anchors_emb, pos_emb, all_emb_t, hn, loss
+            if use_gpu:
+                torch.cuda.empty_cache()
 
         scheduler.step()
         avg_loss = epoch_loss / max(n_batches, 1)
