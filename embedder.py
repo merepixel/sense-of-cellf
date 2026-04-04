@@ -109,7 +109,7 @@ class CellDINOEmbedder(nn.Module):
         try:
             from transformers import AutoModel
             print(f"[embedder] Loading {model_id} via transformers …")
-            model = AutoModel.from_pretrained(model_id)
+            model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
             self._use_transformers = True
             # Probe calling convention with a tiny dummy (on CPU before .to(device))
             self._call_convention = self._probe_convention(model)
@@ -127,31 +127,36 @@ class CellDINOEmbedder(nn.Module):
 
     @staticmethod
     def _probe_convention(model: nn.Module) -> str:
-        """Try different forward signatures on a dummy input and return the one that works."""
-        model.eval()
-        dummy = torch.zeros(1, 3, 224, 224)
-        with torch.no_grad():
-            # 1. transformers DINOv2 — pixel_values kwarg, last_hidden_state
-            try:
-                out = model(pixel_values=dummy)
-                if hasattr(out, 'last_hidden_state'):
-                    return 'pixel_values_cls'
-                if hasattr(out, 'pooler_output') and out.pooler_output is not None:
-                    return 'pixel_values_pool'
-            except TypeError:
-                pass
-            # 2. MAE / custom models — positional x arg, returns tensor or has last_hidden_state
-            try:
-                out = model(dummy)
-                if isinstance(out, torch.Tensor):
-                    return 'positional_direct'
-                if hasattr(out, 'last_hidden_state'):
-                    return 'positional_cls'
-                # fallback: take first tensor attribute
-                return 'positional_direct'
-            except Exception:
-                pass
-        return 'pixel_values_cls'  # last-resort guess
+        """Inspect the forward signature to determine calling convention."""
+        import inspect
+        try:
+            sig = inspect.signature(model.forward)
+            params = list(sig.parameters.keys())
+        except (ValueError, TypeError):
+            params = []
+
+        if 'pixel_values' in params:
+            # Standard transformers DINOv2 — check whether it has pooler_output
+            # by looking at the config (no forward pass needed)
+            cfg = getattr(model, 'config', None)
+            if cfg is not None and getattr(cfg, 'model_type', '') in ('vit', 'dinov2'):
+                return 'pixel_values_cls'
+            return 'pixel_values_cls'
+        else:
+            # MAE / custom models (OpenPhenom) — positional x arg
+            # Run a tiny forward to see if output is a plain tensor or has last_hidden_state
+            model.eval()
+            dummy = torch.zeros(1, 3, 224, 224)
+            with torch.no_grad():
+                try:
+                    out = model(dummy)
+                    if isinstance(out, torch.Tensor):
+                        return 'positional_direct'
+                    if hasattr(out, 'last_hidden_state'):
+                        return 'positional_cls'
+                except Exception:
+                    pass
+            return 'positional_direct'
 
     def _forward_backbone(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Return a (B, D) embedding tensor using the probed calling convention."""
