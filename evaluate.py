@@ -33,6 +33,7 @@ from sklearn.metrics import silhouette_score
 from data_loader import SequenceData, TrackletDict, parse_man_track_txt, load_gt_mask
 from detector import CellDetector, DetectedCell
 from embedder import CellDINOEmbedder
+from logger import get_logger
 
 
 # --------------------------------------------------------------------------- #
@@ -188,37 +189,44 @@ def evaluate(
     seq_dir: Path,
     gt_tra_dir: Path,
     checkpoint: Optional[Path],
+    log_dir: Optional[Path] = None,
+    run_name: Optional[str] = None,
     crop_size: int = 96,
     use_gpu: bool = False,
     ranks: Tuple[int, ...] = (1, 5, 10),
 ) -> None:
-    seq_dir = Path(seq_dir)
+    seq_dir    = Path(seq_dir)
     gt_tra_dir = Path(gt_tra_dir)
+    _log_dir   = Path(log_dir) if log_dir is not None else Path(checkpoint).parent if checkpoint else Path(".")
+    if run_name:
+        _log_dir = _log_dir / run_name
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    log = get_logger("evaluate", _log_dir, "eval.log")
 
     # ------------------------------------------------------------------ #
     # 1. Load sequence and GT annotations
     # ------------------------------------------------------------------ #
-    print(f"[eval] Loading sequence from {seq_dir} …")
+    log.info(f"Loading sequence from {seq_dir} …")
     seq_data = SequenceData(seq_dir, gt_tra_dir=gt_tra_dir)
 
     if seq_data.tracklets is None:
         raise FileNotFoundError(f"man_track.txt not found in {gt_tra_dir}")
 
     tracklets = seq_data.tracklets
-    print(f"[eval] Total tracklets: {len(tracklets)}")
+    log.info(f"Total tracklets: {len(tracklets)}")
 
     # ------------------------------------------------------------------ #
     # 2. Filter tracklets
     # ------------------------------------------------------------------ #
     valid_ids = filter_tracklets(tracklets, min_len=MIN_TRACKLET_LEN)
-    print(f"[eval] Qualifying tracklets (≥{MIN_TRACKLET_LEN} frames): {len(valid_ids)}")
+    log.info(f"Qualifying tracklets (≥{MIN_TRACKLET_LEN} frames): {len(valid_ids)}")
 
     excluded_frames = get_excluded_frames(tracklets)
 
     # ------------------------------------------------------------------ #
     # 3. Detect cells with GT labels (eval mode)
     # ------------------------------------------------------------------ #
-    print("[eval] Running CellPose in eval mode (with GT mask lookup) …")
+    log.info("Running CellPose in eval mode (with GT mask lookup) …")
     detector = CellDetector(crop_size=crop_size, use_gpu=use_gpu)
     frame_detections: Dict[int, List[DetectedCell]] = {}
 
@@ -230,7 +238,7 @@ def evaluate(
     # ------------------------------------------------------------------ #
     # 4. Build gallery / query splits
     # ------------------------------------------------------------------ #
-    gallery_instances: List[Tuple[int, int]] = []   # (cell_id, frame_idx)
+    gallery_instances: List[Tuple[int, int]] = []
     query_instances:   List[Tuple[int, int]] = []
 
     for cell_id in valid_ids:
@@ -238,11 +246,10 @@ def evaluate(
         gallery_instances.extend((cell_id, f) for f in gal_frames)
         query_instances.extend((cell_id, f) for f in qry_frames)
 
-    print(f"[eval] Gallery instances: {len(gallery_instances)}, "
-          f"Query instances: {len(query_instances)}")
+    log.info(f"Gallery instances: {len(gallery_instances)}, Query instances: {len(query_instances)}")
 
     # ------------------------------------------------------------------ #
-    # 5. Load embedder and run evaluation (fine-tuned + frozen baseline)
+    # 5. Load embedder and run evaluation (frozen baseline + fine-tuned)
     # ------------------------------------------------------------------ #
     device = "cuda" if use_gpu else "cpu"
     embedder = CellDINOEmbedder(device=device)
@@ -253,15 +260,14 @@ def evaluate(
     for label, ckpt in [("frozen_baseline", None), ("fine_tuned", checkpoint)]:
         if ckpt is not None:
             if not Path(ckpt).exists():
-                print(f"[eval] Checkpoint {ckpt} not found — skipping fine-tuned eval.")
+                log.warning(f"Checkpoint {ckpt} not found — skipping fine-tuned eval.")
                 continue
             embedder.load_checkpoint(ckpt)
         else:
-            # Re-instantiate to get fresh frozen weights
             embedder = CellDINOEmbedder(device=device)
             embedder.eval()
 
-        print(f"\n[eval] === {label.upper()} ===")
+        log.info(f"=== {label.upper()} ===")
 
         with torch.no_grad():
             gal_emb, gal_labels = embed_instances(
@@ -271,39 +277,37 @@ def evaluate(
                 query_instances, frame_detections, embedder, no_grad=True
             )
 
-        print(f"[eval] Embedded gallery: {gal_emb.shape[0]}, query: {qry_emb.shape[0]}")
+        log.info(f"Embedded gallery: {gal_emb.shape[0]}, query: {qry_emb.shape[0]}")
 
-        # CMC
         cmc = compute_cmc(qry_emb, qry_labels, gal_emb, gal_labels, ranks=ranks)
         for r in ranks:
-            print(f"[eval]   Rank-{r:2d} accuracy: {cmc[r]*100:.1f}%")
+            log.info(f"  Rank-{r:2d} accuracy: {cmc[r]*100:.1f}%")
 
-        # Silhouette (on all instances combined)
         all_emb = np.concatenate([gal_emb, qry_emb], axis=0)
         all_lbl = np.concatenate([gal_labels, qry_labels], axis=0)
 
         if len(set(all_lbl.tolist())) >= 2 and len(all_emb) >= 4:
             sil = silhouette_score(all_emb, all_lbl, metric="cosine")
-            print(f"[eval]   Silhouette score: {sil:.4f}")
+            log.info(f"  Silhouette score: {sil:.4f}")
         else:
             sil = float("nan")
-            print("[eval]   Silhouette: not enough samples")
+            log.info("  Silhouette: not enough samples")
 
         results[label] = {"cmc": cmc, "silhouette": sil}
 
     # ------------------------------------------------------------------ #
     # 6. Summary comparison
     # ------------------------------------------------------------------ #
-    print("\n[eval] ====== SUMMARY ======")
-    print(f"{'Metric':<22} {'Frozen':>10} {'Fine-tuned':>12}")
-    print("-" * 46)
+    log.info("====== SUMMARY ======")
+    log.info(f"{'Metric':<22} {'Frozen':>10} {'Fine-tuned':>12}")
+    log.info("-" * 46)
     for r in ranks:
         frozen_v = results.get("frozen_baseline", {}).get("cmc", {}).get(r, float("nan"))
         ft_v     = results.get("fine_tuned",      {}).get("cmc", {}).get(r, float("nan"))
-        print(f"Rank-{r:<17} {frozen_v*100:>9.1f}% {ft_v*100:>11.1f}%")
+        log.info(f"Rank-{r:<17} {frozen_v*100:>9.1f}% {ft_v*100:>11.1f}%")
     frozen_sil = results.get("frozen_baseline", {}).get("silhouette", float("nan"))
     ft_sil     = results.get("fine_tuned",      {}).get("silhouette", float("nan"))
-    print(f"{'Silhouette':<22} {frozen_sil:>10.4f} {ft_sil:>12.4f}")
+    log.info(f"{'Silhouette':<22} {frozen_sil:>10.4f} {ft_sil:>12.4f}")
 
 
 # --------------------------------------------------------------------------- #

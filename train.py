@@ -29,6 +29,7 @@ from sklearn.metrics import silhouette_score
 from data_loader import SequenceData
 from detector import CellDetector, DetectedCell, match_cells_across_frames
 from embedder import CellDINOEmbedder
+from logger import get_logger
 
 
 # --------------------------------------------------------------------------- #
@@ -270,6 +271,7 @@ def compute_proxy_silhouette(
 def train(
     seq_dir: Path,
     output_dir: Path,
+    run_name: Optional[str] = None,
     epochs: int = 20,
     lr: float = 1e-5,
     weight_decay: float = 1e-4,
@@ -287,27 +289,30 @@ def train(
 ) -> None:
     set_seed(seed)
     output_dir = Path(output_dir)
+    if run_name:
+        output_dir = output_dir / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    log = get_logger("train", output_dir, "train.log")
 
     # ------------------------------------------------------------------ #
     # 1. Load frames
     # ------------------------------------------------------------------ #
-    print(f"[train] Loading sequence from {seq_dir} …")
-    seq_data = SequenceData(seq_dir, gt_tra_dir=None)   # no GT needed
+    log.info(f"Loading sequence from {seq_dir} …")
+    seq_data = SequenceData(seq_dir, gt_tra_dir=None)
     n_frames = seq_data.num_frames()
-    print(f"[train] {n_frames} frames loaded.")
+    log.info(f"{n_frames} frames loaded.")
 
-    # Split held-out frames for silhouette monitoring (last 20% of sequence)
     n_held = max(2, int(n_frames * held_out_frac))
     all_fidx = seq_data.frame_indices
     train_fidx = all_fidx[:-n_held]
     held_fidx = all_fidx[-n_held:]
-    print(f"[train] Train frames: {len(train_fidx)}, held-out: {len(held_fidx)}")
+    log.info(f"Train frames: {len(train_fidx)}, held-out: {len(held_fidx)}")
 
     # ------------------------------------------------------------------ #
     # 2. Detect cells in all training frames (CellPose, no labels)
     # ------------------------------------------------------------------ #
-    print("[train] Running CellPose segmentation …")
+    log.info("Running CellPose segmentation …")
     detector = CellDetector(crop_size=crop_size, use_gpu=use_gpu)
 
     train_detections: Dict[int, List[DetectedCell]] = {}
@@ -323,8 +328,7 @@ def train(
     # ------------------------------------------------------------------ #
     # 3. Build positive pairs across consecutive training frames
     # ------------------------------------------------------------------ #
-    print("[train] Building positive pairs …")
-    # pairs[i] = (cells_t, cells_t1, matched_pairs)
+    log.info("Building positive pairs …")
     pos_pair_data = []
     sorted_train = sorted(train_fidx)
     for i in range(len(sorted_train) - 1):
@@ -340,31 +344,31 @@ def train(
             pos_pair_data.append((cells_t, cells_t1, pairs))
 
     total_pairs = sum(len(p) for _, _, p in pos_pair_data)
-    print(f"[train] Found {total_pairs} positive pairs across "
-          f"{len(pos_pair_data)} consecutive frame-pairs.")
+    log.info(f"Found {total_pairs} positive pairs across {len(pos_pair_data)} consecutive frame-pairs.")
 
     # ------------------------------------------------------------------ #
     # 4. Load embedder
     # ------------------------------------------------------------------ #
-    print("[train] Loading Cell-DINO embedder …")
+    log.info("Loading Cell-DINO embedder …")
     embedder = CellDINOEmbedder(device="cuda" if use_gpu else "cpu")
 
     if resume_from is not None:
         resume_from = Path(resume_from)
         embedder.load_checkpoint(resume_from)
-        print(f"[train] Resumed from {resume_from}, starting at epoch {start_epoch}")
+        log.info(f"Resumed from {resume_from}, starting at epoch {start_epoch}")
 
     embedder.train()
 
-    optimizer = AdamW(
-        embedder.backbone.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-    # Scheduler covers the remaining epochs from start_epoch onward
+    optimizer = AdamW(embedder.backbone.parameters(), lr=lr, weight_decay=weight_decay)
     remaining = max(1, epochs - start_epoch + 1)
     scheduler = CosineAnnealingLR(optimizer, T_max=remaining, eta_min=lr * 0.1)
     criterion = NTXentLoss(temperature=temperature)
+
+    # Log config
+    log.info(
+        f"Config: epochs={epochs} start={start_epoch} lr={lr} wd={weight_decay} "
+        f"temp={temperature} hard_neg_k={hard_neg_k} crop={crop_size}"
+    )
 
     # ------------------------------------------------------------------ #
     # 5. Epoch loop
@@ -377,14 +381,13 @@ def train(
         epoch_loss = 0.0
         n_batches = 0
 
-        # Shuffle frame-pair order each epoch
         random.shuffle(pos_pair_data)
 
         for cells_t, cells_t1, matched in pos_pair_data:
             if not matched:
                 continue
 
-            anchor_idx = [i for i, _ in matched]
+            anchor_idx   = [i for i, _ in matched]
             pos_idx_list = [j for _, j in matched]
 
             anchor_crops = [cells_t[i].crop for i in anchor_idx]
@@ -393,20 +396,14 @@ def train(
             if not anchor_crops:
                 continue
 
-            # Only anchors need gradients.
-            # Positives and hard-neg candidates use stop-gradient (no_grad),
-            # which halves activation memory and is standard in contrastive learning.
-            anchors_emb = embedder.embed_crops(anchor_crops, no_grad=False)  # (N, D) with grad
+            anchors_emb = embedder.embed_crops(anchor_crops, no_grad=False)
 
             with torch.no_grad():
-                pos_emb = embedder.embed_crops(pos_crops, no_grad=True)       # (N, D) detached
-
-                # Hard negatives: embed ALL cells in frame t, mine top-k
+                pos_emb     = embedder.embed_crops(pos_crops, no_grad=True)
                 all_crops_t = [c.crop for c in cells_t]
-                all_emb_t   = embedder.embed_crops(all_crops_t, no_grad=True) # (M, D) detached
+                all_emb_t   = embedder.embed_crops(all_crops_t, no_grad=True)
 
-            hn = mine_hard_negatives(all_emb_t, anchor_idx, k=hard_neg_k)    # (N, K, D)
-
+            hn   = mine_hard_negatives(all_emb_t, anchor_idx, k=hard_neg_k)
             loss = criterion(anchors_emb, pos_emb, hard_negatives=hn)
 
             optimizer.zero_grad()
@@ -415,33 +412,29 @@ def train(
             optimizer.step()
 
             epoch_loss += loss.item()
-            n_batches += 1
+            n_batches  += 1
 
-            # Free graph memory immediately between frame-pairs
             del anchors_emb, pos_emb, all_emb_t, hn, loss
             if use_gpu:
                 torch.cuda.empty_cache()
 
         scheduler.step()
         avg_loss = epoch_loss / max(n_batches, 1)
-        print(f"[train] Epoch {epoch:3d}/{epochs} | loss={avg_loss:.4f}", end="")
+        msg = f"Epoch {epoch:3d}/{epochs} | loss={avg_loss:.4f}"
 
-        # Silhouette monitoring
         if epoch % silhouette_every == 0 or epoch == epochs:
             sil = compute_proxy_silhouette(embedder, held_detections, held_fidx)
-            print(f" | silhouette={sil:.4f}", end="")
+            msg += f" | silhouette={sil:.4f}"
 
             if sil > best_silhouette:
                 best_silhouette = sil
                 embedder.save_checkpoint(best_ckpt_path)
-                print(f" ← best", end="")
+                msg += " ← best"
 
-        print()
+        log.info(msg)
 
-    print(f"\n[train] Training complete. Best silhouette: {best_silhouette:.4f}")
-    print(f"[train] Best checkpoint: {best_ckpt_path}")
-
-    # Save final checkpoint too
+    log.info(f"Training complete. Best silhouette: {best_silhouette:.4f}")
+    log.info(f"Best checkpoint: {best_ckpt_path}")
     embedder.save_checkpoint(output_dir / "final_checkpoint.pt")
 
 
