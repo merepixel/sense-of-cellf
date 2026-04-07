@@ -201,7 +201,7 @@ def evaluate(
     if run_name:
         _log_dir = _log_dir / run_name
     _log_dir.mkdir(parents=True, exist_ok=True)
-    log = get_logger("evaluate", _log_dir, "eval.log")
+    log = get_logger("evaluate", _log_dir, "eval.txt")
 
     # ------------------------------------------------------------------ #
     # 1. Load sequence and GT annotations

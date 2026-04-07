@@ -27,6 +27,8 @@ def get_logger(name: str, log_dir: Path, filename: str) -> logging.Logger:
         return logger
 
     logger.setLevel(logging.DEBUG)
+    # Stop messages bubbling up to the root logger (prevents Colab's duplicate INFO: lines)
+    logger.propagate = False
     fmt = logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
     # File handler — append mode so resumed runs accumulate in one file
@@ -34,8 +36,15 @@ def get_logger(name: str, log_dir: Path, filename: str) -> logging.Logger:
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    # Stdout handler
-    sh = logging.StreamHandler(sys.stdout)
+    # Stdout handler — wrapped to silently ignore Colab transport disconnects
+    class _SafeStreamHandler(logging.StreamHandler):
+        def emit(self, record):
+            try:
+                super().emit(record)
+            except OSError:
+                pass
+
+    sh = _SafeStreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     logger.addHandler(sh)
 

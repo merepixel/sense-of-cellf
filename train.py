@@ -293,7 +293,7 @@ def train(
         output_dir = output_dir / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    log = get_logger("train", output_dir, "train.log")
+    log = get_logger("train", output_dir, "train.txt")
 
     # ------------------------------------------------------------------ #
     # 1. Load frames
