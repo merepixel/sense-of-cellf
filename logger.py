@@ -25,8 +25,11 @@ def get_logger(name: str, log_dir: Path, filename: str) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / filename
 
-    logger = logging.getLogger(name)
-    # Avoid adding duplicate handlers if called multiple times
+    # Use the full log path as the logger name so that different runs/files
+    # (train.txt vs eval.txt, or different run_name dirs) each get their own
+    # logger instance.  A plain name like "evaluate" would be reused across
+    # calls and return stale handlers pointing to the wrong file.
+    logger = logging.getLogger(str(log_path))
     if logger.handlers:
         return logger
 

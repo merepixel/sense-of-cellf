@@ -11,12 +11,20 @@ The embedder is used:
   - During evaluation (no gradient)  — frozen after loading checkpoint
 """
 
+import os
+import warnings
 from pathlib import Path
 from typing import List, Optional, Union
+
 import numpy as np
 import torch
 import torch.nn as nn
 from torchvision import transforms
+
+# Silence HuggingFace Hub authentication warnings — we only use public models
+# and don't need a token.
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+warnings.filterwarnings("ignore", message=".*HF_TOKEN.*", category=UserWarning)
 
 # --------------------------------------------------------------------------- #
 # HuggingFace model IDs
