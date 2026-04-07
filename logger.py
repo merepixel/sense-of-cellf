@@ -5,8 +5,12 @@ Lightweight logger that writes to stdout AND a timestamped log file simultaneous
 
 import logging
 import sys
-from datetime import datetime
 from pathlib import Path
+
+# Prevent Python's logging framework from printing "--- Logging error ---"
+# tracebacks when a handler's stream is disconnected (common in Colab when
+# the frontend briefly loses its ZMQ socket connection).
+logging.raiseExceptions = False
 
 
 def get_logger(name: str, log_dir: Path, filename: str) -> logging.Logger:

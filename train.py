@@ -137,15 +137,20 @@ class NTXentLoss(torch.nn.Module):
         """
         Cross-entropy loss where for each row i the correct column is pos_idx[i].
 
-        extra_neg_cols: (N, K) — appended as additional negative logits.
+        extra_neg_cols: (N, K) — appended as additional negative logits for the
+        first N rows only.  The remainder (sim[N:]) may be empty when the caller
+        passes only the anchor half of the similarity matrix; guard against that
+        to avoid F.cross_entropy returning nan on a zero-sample batch.
         """
         if extra_neg_cols is not None:
             N = extra_neg_cols.shape[0]
-            # Only modify the first N rows (anchor rows)
             sim_aug = torch.cat([sim[:N], extra_neg_cols], dim=1)     # (N, 2N+K)
             loss_aug = F.cross_entropy(sim_aug, pos_idx[:N])
+            n_rest = sim.shape[0] - N
+            if n_rest == 0:
+                return loss_aug
             loss_rest = F.cross_entropy(sim[N:], pos_idx[N:])
-            return (loss_aug * N + loss_rest * (sim.shape[0] - N)) / sim.shape[0]
+            return (loss_aug * N + loss_rest * n_rest) / sim.shape[0]
 
         return F.cross_entropy(sim, pos_idx)
 
