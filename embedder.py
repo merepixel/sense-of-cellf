@@ -265,13 +265,17 @@ class CellDINOEmbedder(nn.Module):
     # ------------------------------------------------------------------ #
 
     def save_checkpoint(self, path: Union[str, Path]) -> None:
+        """Save model weights only (used by evaluate.py)."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self.backbone.state_dict(), str(path))
         print(f"[embedder] Checkpoint saved → {path}")
 
     def load_checkpoint(self, path: Union[str, Path]) -> None:
+        """Load model weights.  Handles both plain state-dicts (old format) and
+        the full training checkpoint dicts written by train.py (new format)."""
         path = Path(path)
-        state = torch.load(str(path), map_location=self.device)
+        ckpt = torch.load(str(path), map_location=self.device)
+        state = ckpt["model_state"] if isinstance(ckpt, dict) and "model_state" in ckpt else ckpt
         self.backbone.load_state_dict(state)
         print(f"[embedder] Checkpoint loaded ← {path}")

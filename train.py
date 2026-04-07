@@ -193,6 +193,61 @@ def mine_hard_negatives(
 
 
 # --------------------------------------------------------------------------- #
+# Full checkpoint helpers (model + optimizer + scheduler + epoch + silhouette)
+# --------------------------------------------------------------------------- #
+
+def save_training_checkpoint(
+    path: Path,
+    embedder: "CellDINOEmbedder",
+    optimizer,
+    scheduler,
+    epoch: int,
+    best_silhouette: float,
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state":     embedder.backbone.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "epoch":           epoch,
+            "best_silhouette": best_silhouette,
+        },
+        str(path),
+    )
+    print(f"[train] Checkpoint saved → {path}  (epoch={epoch}, sil={best_silhouette:.4f})")
+
+
+def load_training_checkpoint(
+    path: Path,
+    embedder: "CellDINOEmbedder",
+    optimizer,
+    scheduler,
+) -> tuple:
+    """
+    Load a full training checkpoint.  Returns (epoch, best_silhouette).
+    Falls back gracefully if the file is an old-format plain state-dict.
+    """
+    path = Path(path)
+    ckpt = torch.load(str(path), map_location=embedder.device)
+    if isinstance(ckpt, dict) and "model_state" in ckpt:
+        embedder.backbone.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        epoch = ckpt["epoch"]
+        best_silhouette = ckpt.get("best_silhouette", -2.0)
+        print(f"[train] Checkpoint loaded ← {path}  (epoch={epoch}, sil={best_silhouette:.4f})")
+    else:
+        # Old format: plain model state-dict only
+        embedder.backbone.load_state_dict(ckpt)
+        epoch = 0
+        best_silhouette = -2.0
+        print(f"[train] Checkpoint loaded ← {path}  (old format — optimizer/scheduler reset)")
+    return epoch, best_silhouette
+
+
+# --------------------------------------------------------------------------- #
 # Silhouette score proxy (no labels needed — uses CellPose track IDs)
 # --------------------------------------------------------------------------- #
 
@@ -290,7 +345,6 @@ def train(
     use_gpu: bool = False,
     seed: int = 42,
     resume_from: Optional[Path] = None,
-    start_epoch: int = 1,
 ) -> None:
     set_seed(seed)
     output_dir = Path(output_dir)
@@ -356,18 +410,26 @@ def train(
     # ------------------------------------------------------------------ #
     log.info("Loading Cell-DINO embedder …")
     embedder = CellDINOEmbedder(device="cuda" if use_gpu else "cpu")
-
-    if resume_from is not None:
-        resume_from = Path(resume_from)
-        embedder.load_checkpoint(resume_from)
-        log.info(f"Resumed from {resume_from}, starting at epoch {start_epoch}")
-
     embedder.train()
 
     optimizer = AdamW(embedder.backbone.parameters(), lr=lr, weight_decay=weight_decay)
-    remaining = max(1, epochs - start_epoch + 1)
-    scheduler = CosineAnnealingLR(optimizer, T_max=remaining, eta_min=lr * 0.1)
+    # T_max covers the full run so scheduler position is correctly restored on resume
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.1)
     criterion = NTXentLoss(temperature=temperature)
+
+    start_epoch = 1
+    best_silhouette = -2.0
+
+    if resume_from is not None:
+        resume_from = Path(resume_from)
+        if resume_from.exists():
+            last_epoch, best_silhouette = load_training_checkpoint(
+                resume_from, embedder, optimizer, scheduler
+            )
+            start_epoch = last_epoch + 1
+            log.info(f"Resumed from {resume_from}  →  starting at epoch {start_epoch}, best_sil={best_silhouette:.4f}")
+        else:
+            log.warning(f"resume_from not found ({resume_from}), starting fresh.")
 
     # Log config
     log.info(
@@ -378,7 +440,6 @@ def train(
     # ------------------------------------------------------------------ #
     # 5. Epoch loop
     # ------------------------------------------------------------------ #
-    best_silhouette = -2.0
     best_ckpt_path = output_dir / "best_checkpoint.pt"
 
     for epoch in range(start_epoch, epochs + 1):
@@ -441,14 +502,18 @@ def train(
 
             if sil > best_silhouette:
                 best_silhouette = sil
-                embedder.save_checkpoint(best_ckpt_path)
+                save_training_checkpoint(
+                    best_ckpt_path, embedder, optimizer, scheduler, epoch, best_silhouette
+                )
                 msg += " ← best"
 
         log.info(msg)
 
     log.info(f"Training complete. Best silhouette: {best_silhouette:.4f}")
     log.info(f"Best checkpoint: {best_ckpt_path}")
-    embedder.save_checkpoint(output_dir / "final_checkpoint.pt")
+    save_training_checkpoint(
+        output_dir / "final_checkpoint.pt", embedder, optimizer, scheduler, epochs, best_silhouette
+    )
 
 
 # --------------------------------------------------------------------------- #
