@@ -36,13 +36,16 @@ def get_logger(name: str, log_dir: Path, filename: str) -> logging.Logger:
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    # Stdout handler — wrapped to silently ignore Colab transport disconnects
+    # Stdout handler — wrapped to silently ignore Colab transport disconnects.
+    # Must override handleError (not emit) because the base StreamHandler.emit
+    # already catches all exceptions internally and routes them to handleError.
     class _SafeStreamHandler(logging.StreamHandler):
-        def emit(self, record):
-            try:
-                super().emit(record)
-            except OSError:
-                pass
+        def handleError(self, record):
+            import sys
+            exc_type = sys.exc_info()[0]
+            if exc_type is OSError:
+                return          # silently drop transport-disconnect errors
+            super().handleError(record)
 
     sh = _SafeStreamHandler(sys.stdout)
     sh.setFormatter(fmt)

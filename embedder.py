@@ -178,24 +178,29 @@ class CellDINOEmbedder(nn.Module):
             return 'positional_direct'
 
     def _forward_backbone(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Return a (B, D) embedding tensor using the probed calling convention."""
+        """Return a (B, D) embedding tensor using the probed calling convention.
+
+        Grad context is managed entirely by the caller (embed_crops / training loop).
+        Do NOT use set_grad_enabled here — it overrides explicit torch.no_grad()
+        contexts in the training loop and causes hard-negative gradients to leak
+        into the anchor backward pass, producing NaN loss.
+        """
         conv = self._call_convention
-        with torch.set_grad_enabled(self.training):
-            if conv == 'pixel_values_cls':
-                out = self.backbone(pixel_values=pixel_values)
-                return out.last_hidden_state[:, 0, :]
-            elif conv == 'pixel_values_pool':
-                out = self.backbone(pixel_values=pixel_values)
-                return out.pooler_output
-            elif conv == 'positional_cls':
-                out = self.backbone(pixel_values)
-                return out.last_hidden_state[:, 0, :]
-            else:  # positional_direct
-                out = self.backbone(pixel_values)
-                if isinstance(out, torch.Tensor):
-                    # If shape is (B, D) use as-is; if (B, N, D) take CLS (index 0)
-                    return out[:, 0] if out.dim() == 3 else out
-                return out.last_hidden_state[:, 0, :]
+        if conv == 'pixel_values_cls':
+            out = self.backbone(pixel_values=pixel_values)
+            return out.last_hidden_state[:, 0, :]
+        elif conv == 'pixel_values_pool':
+            out = self.backbone(pixel_values=pixel_values)
+            return out.pooler_output
+        elif conv == 'positional_cls':
+            out = self.backbone(pixel_values)
+            return out.last_hidden_state[:, 0, :]
+        else:  # positional_direct
+            out = self.backbone(pixel_values)
+            if isinstance(out, torch.Tensor):
+                # If shape is (B, D) use as-is; if (B, N, D) take CLS (index 0)
+                return out[:, 0] if out.dim() == 3 else out
+            return out.last_hidden_state[:, 0, :]
 
     # ------------------------------------------------------------------ #
     # nn.Module forward

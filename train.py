@@ -406,12 +406,20 @@ def train(
             hn   = mine_hard_negatives(all_emb_t, anchor_idx, k=hard_neg_k)
             loss = criterion(anchors_emb, pos_emb, hard_negatives=hn)
 
+            loss_val = loss.item()
+            if not torch.isfinite(loss).item():
+                log.warning(f"  Skipping non-finite loss ({loss_val}) at epoch {epoch}")
+                del anchors_emb, pos_emb, all_emb_t, hn, loss
+                if use_gpu:
+                    torch.cuda.empty_cache()
+                continue
+
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(embedder.backbone.parameters(), max_norm=1.0)
             optimizer.step()
 
-            epoch_loss += loss.item()
+            epoch_loss += loss_val
             n_batches  += 1
 
             del anchors_emb, pos_emb, all_emb_t, hn, loss
