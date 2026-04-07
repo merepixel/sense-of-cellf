@@ -282,6 +282,8 @@ def train(
     crop_size: int = 96,
     use_gpu: bool = False,
     seed: int = 42,
+    resume_from: Optional[Path] = None,
+    start_epoch: int = 1,
 ) -> None:
     set_seed(seed)
     output_dir = Path(output_dir)
@@ -346,6 +348,12 @@ def train(
     # ------------------------------------------------------------------ #
     print("[train] Loading Cell-DINO embedder …")
     embedder = CellDINOEmbedder(device="cuda" if use_gpu else "cpu")
+
+    if resume_from is not None:
+        resume_from = Path(resume_from)
+        embedder.load_checkpoint(resume_from)
+        print(f"[train] Resumed from {resume_from}, starting at epoch {start_epoch}")
+
     embedder.train()
 
     optimizer = AdamW(
@@ -353,7 +361,9 @@ def train(
         lr=lr,
         weight_decay=weight_decay,
     )
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.1)
+    # Scheduler covers the remaining epochs from start_epoch onward
+    remaining = max(1, epochs - start_epoch + 1)
+    scheduler = CosineAnnealingLR(optimizer, T_max=remaining, eta_min=lr * 0.1)
     criterion = NTXentLoss(temperature=temperature)
 
     # ------------------------------------------------------------------ #
@@ -362,7 +372,7 @@ def train(
     best_silhouette = -2.0
     best_ckpt_path = output_dir / "best_checkpoint.pt"
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         embedder.train()
         epoch_loss = 0.0
         n_batches = 0
